@@ -3,6 +3,7 @@ import { test } from "node:test";
 import type { AuditResult } from "../lib/audit";
 import { createSearch, resetSheetCache, runStep, type Deps } from "../lib/pipeline";
 import type { PlaceResult, PlacesClient } from "../lib/places";
+import type { Rect } from "../lib/types";
 import type { CellUpdate, SheetClient, SheetData } from "../lib/sheets";
 import { FileStore } from "../lib/store/file";
 import { SHEET_COLUMNS } from "../lib/columns";
@@ -16,6 +17,9 @@ const place = (i: number, o: Partial<PlaceResult> = {}): PlaceResult => ({
 class FakePlaces implements PlacesClient {
   configured = true;
   constructor(private pages: PlaceResult[][]) {}
+  async locate(): Promise<Rect> {
+    return { low: { latitude: 30, longitude: -98 }, high: { latitude: 31, longitude: -97 } };
+  }
   async search(_q: string, _r: string, token: string | null) {
     const i = token ? Number(token) : 0;
     return { places: this.pages[i] ?? [], nextPageToken: i + 1 < this.pages.length ? String(i + 1) : null };
@@ -77,7 +81,7 @@ async function runToEnd(id: string, d: Deps) {
 
 const params = {
   category: "Car Detailing", country: "US", region: "TX", areas: ["Austin"], minRating: 4.0, minReviews: 15,
-  conditions: ["no_website", "outdated", "poor", "broken"], targetLeads: 50,
+  conditions: ["no_website", "outdated", "poor", "broken"], targetLeads: 50, skipAudit: false,
 };
 
 test("full workflow: filters, duplicates, safe merges, new rows", async () => {
@@ -174,6 +178,9 @@ test("temporary API failures are retried and do not lose results", async () => {
   let calls = 0;
   const flaky: PlacesClient = {
     configured: true,
+    async locate() {
+      return null; // also exercises the plain text-search fallback
+    },
     async search() {
       calls++;
       if (calls === 1) throw new Error("503 backend unavailable");
@@ -183,8 +190,64 @@ test("temporary API failures are retried and do not lose results", async () => {
   const sheet = new FakeSheet();
   const d = deps(flaky, sheet);
   const created = await createSearch(params, d);
-  const first = await runStep(created.id, d);
-  assert.match(first!.message, /Temporary problem/);
+  await runStep(created.id, d); // step 1: locate area (falls back to text search)
+  const failed = await runStep(created.id, d); // step 2: search hits the simulated outage
+  assert.match(failed!.message, /Temporary problem/);
   const s = await runToEnd(created.id, d);
   assert.equal(s.summary.added, 1);
+});
+
+/** Fake Google with businesses at fixed coordinates; like the real API, each search returns at most 60. */
+class GridPlaces implements PlacesClient {
+  configured = true;
+  requests = 0;
+  points: { p: PlaceResult; lat: number; lng: number }[] = [];
+  constructor(n: number) {
+    for (let i = 0; i < n; i++) {
+      // Clustered: half the businesses packed in one small "downtown" corner.
+      const dense = i % 2 === 0;
+      const lat = dense ? 30.1 + (i % 17) * 0.004 : 30 + ((i * 37) % 100) / 100;
+      const lng = dense ? -97.9 + (i % 13) * 0.005 : -98 + ((i * 53) % 100) / 100;
+      this.points.push({ p: place(1000 + i, { website: i % 3 ? `https://business${1000 + i}.com` : "" }), lat, lng });
+    }
+  }
+  async locate(): Promise<Rect> {
+    return { low: { latitude: 30, longitude: -98 }, high: { latitude: 31, longitude: -97 } };
+  }
+  async search(_q: string, _r: string, token: string | null, rect?: Rect) {
+    this.requests++;
+    const inside = this.points
+      .filter((x) => !rect || (x.lat >= rect.low.latitude && x.lat < rect.high.latitude && x.lng >= rect.low.longitude && x.lng < rect.high.longitude))
+      .slice(0, 60)
+      .map((x) => x.p);
+    const start = token ? Number(token) : 0;
+    const next = start + 20 < inside.length ? String(start + 20) : null;
+    return { places: inside.slice(start, start + 20), nextPageToken: next };
+  }
+}
+
+test("whole-state grid search finds far more than 60 businesses and exports all of them", async () => {
+  resetSheetCache();
+  const google = new GridPlaces(300);
+  const sheet = new FakeSheet();
+  const d = deps(google, sheet);
+  const created = await createSearch({ ...params, areas: [], targetLeads: 0, skipAudit: true, conditions: [] }, d);
+  let s = created;
+  for (let i = 0; i < 5000 && s.stage !== "done" && s.stage !== "failed"; i++) s = (await runStep(created.id, d))!;
+  assert.equal(s.stage, "done");
+  assert.equal(s.summary.discovered, 300, "every business found despite the 60-per-search cap");
+  assert.equal(s.summary.added, 300);
+  assert.equal(sheet.rows.length, 300);
+  assert.ok(s.coverage.areasTotal > 5, "dense areas were split into smaller tiles");
+  const statuses = new Set(sheet.rows.map((r) => r[sheet.col("Website Status")]));
+  assert.deepEqual([...statuses].sort(), ["No website found", "Not verified"]);
+});
+
+test("manual-review mode exports businesses with good websites too", async () => {
+  resetSheetCache();
+  const sheet = new FakeSheet();
+  const d = deps(new FakePlaces([[place(3), place(7), place(8)]]), sheet); // 3 and 7 would audit as "Good"
+  const created = await createSearch({ ...params, skipAudit: true, conditions: [] }, d);
+  const s = await runToEnd(created.id, d);
+  assert.equal(s.summary.added, 3);
 });

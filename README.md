@@ -71,7 +71,7 @@ If Google Sheets is not configured, nothing is claimed as exported: the summary 
 
 | Phase | What happens |
 |---|---|
-| Searching for businesses | Google Places Text Search, `"<category> in <area>, <state>, <country>"`, up to 3 pages × 20 results per area |
+| Searching for businesses | The state (or each city you typed) is located on the map, then searched as a grid of map tiles with Google Places Text Search. Any tile that returns a full page (20+) is split into 4 smaller tiles and searched again |
 | Collecting business information | Keeps only `OPERATIONAL` businesses in the chosen state with rating ≥ min and reviews ≥ min |
 | Checking for duplicates | Compares each candidate with **every row** of the sheet before spending audit quota |
 | Auditing websites | Website inspection + PageSpeed mobile & desktop for new businesses with a website |
@@ -81,9 +81,18 @@ Searches are saved after every step. If an API fails, the step is retried automa
 repeated failures the search pauses with the error shown and a **Resume** button. Closing the tab is
 safe — reopen the URL (`/?batch=<id>`) to continue.
 
-**Coverage is not complete.** Google returns at most 60 results per query. To cover more of a
-state, enter several cities/areas (comma-separated); each is searched separately. If the requested
-number of leads can't be reached, the summary says how many were found.
+**Whole-state coverage.** Google returns at most 60 results per search, so WebNest never relies on
+one search per state. Leave *City / target area* empty and the whole state is covered tile by tile;
+busy areas keep being split (down to ~2 km tiles) until Google returns less than a full page.
+This finds essentially everything Google lists for that category, but it is still limited to what
+Google's search returns. A state-wide search can use hundreds to thousands of billed Places requests;
+the progress screen shows the count, and `MAX_PLACES_REQUESTS_PER_SEARCH` (default 5000) stops a
+runaway search.
+
+**All businesses / manual review.** Tick *All businesses found* to remove the lead limit, and
+*Export every business — I'll check them one by one* to skip website audits: every business that
+passes the rating/review/location filters is exported (duplicates are still removed). In that mode
+Website Status is `No website found` or `Not verified` and Quality is left empty.
 
 ### Fields and where they come from
 

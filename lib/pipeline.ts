@@ -18,7 +18,7 @@ import { googlePlaces, type PlaceResult, type PlacesClient } from "./places";
 import { googleSheets, type CellUpdate, type SheetClient, type SheetData } from "./sheets";
 import { getStore, type Store } from "./store";
 import type {
-  Batch, BatchStatus, BatchSummary, Candidate, CountryCode, DiscoveryQuery, Lead, SearchParams, WebsiteCondition,
+  Batch, BatchStatus, BatchSummary, Candidate, CountryCode, DiscoveryQuery, Lead, Rect, SearchParams, WebsiteCondition,
 } from "./types";
 
 export interface Deps {
@@ -36,6 +36,12 @@ export function defaultDeps(): Deps {
 const AUDIT_CONCURRENCY = 4;
 const PENDING_BUFFER = 4;
 const MAX_PAGES_PER_QUERY = 3; // Places Text Search returns at most 60 results per query
+/** A map tile that returns at least one full page is split into 4 smaller tiles. */
+const SPLIT_THRESHOLD = 20;
+const MIN_TILE_DEGREES = 0.02; // ~2 km — tiles are not split below this
+const MAX_TILE_DEPTH = 12;
+/** Safety cap on billed Places requests per search (override with MAX_PLACES_REQUESTS_PER_SEARCH). */
+const maxPlacesRequests = () => Number(process.env.MAX_PLACES_REQUESTS_PER_SEARCH) || 5000;
 const MAX_ERROR_STREAK = 5;
 const BATCH_LOCK_TTL = 300;
 const EXPORT_LOCK = "sheet-export";
@@ -73,22 +79,52 @@ export function validateParams(input: unknown): SearchParams {
   if (!(minRating >= 0 && minRating <= 5)) fail("Minimum rating must be between 0 and 5.");
   const minReviews = Math.floor(Number(p.minReviews ?? 0));
   if (!(minReviews >= 0 && minReviews <= 100_000)) fail("Minimum reviews must be 0 or more.");
+  const skipAudit = p.skipAudit === true;
   const conditions = (Array.isArray(p.conditions) ? p.conditions : []).filter((c): c is WebsiteCondition =>
     ALL_CONDITIONS.includes(c as WebsiteCondition),
   );
-  if (!conditions.length) fail("Select at least one website condition.");
+  if (!conditions.length && !skipAudit) fail("Select at least one website condition.");
   const targetLeads = Math.floor(Number(p.targetLeads ?? 0));
-  if (!(targetLeads >= 1 && targetLeads <= 500)) fail("Number of leads must be between 1 and 500.");
-  return { category, country, region, areas, minRating, minReviews, conditions: [...new Set(conditions)], targetLeads };
+  if (!(targetLeads >= 0 && targetLeads <= 100_000)) fail("Number of leads must be 0 (all) or more.");
+  return { category, country, region, areas, minRating, minReviews, conditions: [...new Set(conditions)], targetLeads, skipAudit };
 }
 
+/** Each area (or the whole state) is first resolved to its map boundary, then searched as a grid. */
 function buildQueries(p: SearchParams): DiscoveryQuery[] {
   const country = getCountry(p.country)!;
   const region = getRegion(p.country, p.region)!;
-  const what = categoryQuery(p.category);
   const places = p.areas.length ? p.areas.map((a) => `${a}, ${region.name}`) : [region.name];
-  return places.map((where) => ({ text: `${what} in ${where}, ${country.name}`, pageToken: null, pages: 0, done: false }));
+  return places.map((where) => ({ kind: "area", text: `${where}, ${country.name}`, pageToken: null, pages: 0, done: false }));
 }
+
+/** Split a viewport that crosses the antimeridian (e.g. Alaska) into two rectangles. */
+function normalizeRect(r: Rect): Rect[] {
+  if (r.low.longitude <= r.high.longitude) return [r];
+  return [
+    { low: r.low, high: { latitude: r.high.latitude, longitude: 180 } },
+    { low: { latitude: r.low.latitude, longitude: -180 }, high: r.high },
+  ];
+}
+
+function splitRect(r: Rect): Rect[] {
+  const midLat = (r.low.latitude + r.high.latitude) / 2;
+  const midLng = (r.low.longitude + r.high.longitude) / 2;
+  const box = (a: number, b: number, c: number, d: number): Rect => ({ low: { latitude: a, longitude: b }, high: { latitude: c, longitude: d } });
+  return [
+    box(r.low.latitude, r.low.longitude, midLat, midLng),
+    box(r.low.latitude, midLng, midLat, r.high.longitude),
+    box(midLat, r.low.longitude, r.high.latitude, midLng),
+    box(midLat, midLng, r.high.latitude, r.high.longitude),
+  ];
+}
+
+const canSplit = (r: Rect, depth: number) =>
+  depth < MAX_TILE_DEPTH &&
+  (r.high.latitude - r.low.latitude > MIN_TILE_DEGREES || r.high.longitude - r.low.longitude > MIN_TILE_DEGREES);
+
+const tile = (text: string, rect: Rect, depth: number): DiscoveryQuery => ({
+  kind: "tile", text, rect, depth, count: 0, pageToken: null, pages: 0, done: false,
+});
 
 // ---------------------------------------------------------------- helpers
 
@@ -222,6 +258,11 @@ export async function getStatus(id: string, deps: Deps): Promise<BatchStatus | n
     sheetUrl: batch.exportMode === "sheets" ? deps.sheets.url : null,
     createdAt: batch.createdAt,
     summary: summarize(cands),
+    coverage: {
+      areasDone: batch.cursor.queries.filter((q) => q.done).length,
+      areasTotal: batch.cursor.queries.length,
+      placesRequests: batch.cursor.placesRequests ?? 0,
+    },
   };
 }
 
@@ -307,26 +348,56 @@ async function searchStep(batch: Batch, deps: Deps) {
   const { store } = deps;
   const params = batch.params;
   const cands = await store.listCandidates(batch.id);
+  const target = params.targetLeads > 0 ? params.targetLeads : Infinity;
   let qualified = cands.filter((c) => c.state === "qualified").length;
   const pending = cands.filter((c) => c.state === "pending");
-  const nextQuery = batch.cursor.queries.find((q) => !q.done);
+  const cursor = batch.cursor;
+  let nextQuery = cursor.queries.find((q) => !q.done);
 
-  if (qualified >= params.targetLeads || (!pending.length && !nextQuery)) {
-    const exhausted = qualified < params.targetLeads;
+  if (nextQuery && (cursor.placesRequests ?? 0) >= maxPlacesRequests()) {
+    for (const q of cursor.queries) q.done = true;
+    nextQuery = undefined;
+    await store.updateBatch(batch.id, {
+      cursor,
+      message: `Stopped searching after ${maxPlacesRequests()} Places requests (safety limit MAX_PLACES_REQUESTS_PER_SEARCH). `,
+    });
+    batch.message = `Stopped searching after ${maxPlacesRequests()} Places requests (safety limit MAX_PLACES_REQUESTS_PER_SEARCH).`;
+  }
+
+  if (qualified >= target || (!pending.length && !nextQuery)) {
+    const short = Number.isFinite(target) && qualified < target;
     await store.updateBatch(batch.id, {
       stage: "exporting",
       phase: PHASES.exporting,
-      message: exhausted
-        ? `Found ${qualified} of ${params.targetLeads} requested leads — the data source has no more results for this search. Add more cities/areas to search further.`
-        : "",
+      message: [
+        batch.message.startsWith("Stopped") ? batch.message : "",
+        short ? `Found ${qualified} of ${params.targetLeads} requested leads — every map area was searched and Google returned no more matching businesses.` : "",
+      ].filter(Boolean).join(" "),
     });
     return;
   }
 
   // 1) Discover: fetch the next page of results when the audit queue runs low.
   if (pending.length < PENDING_BUFFER && nextQuery) {
-    await store.updateBatch(batch.id, { phase: PHASES.searching, message: `Searching: "${nextQuery.text}" (page ${nextQuery.pages + 1})` });
-    const page = await deps.places.search(nextQuery.text, params.country, nextQuery.pageToken);
+    cursor.placesRequests = (cursor.placesRequests ?? 0) + 1;
+    const what = categoryQuery(params.category);
+
+    if (nextQuery.kind === "area") {
+      await store.updateBatch(batch.id, { phase: PHASES.searching, message: `Locating ${nextQuery.text} on the map` });
+      const rect = await deps.places.locate(nextQuery.text, params.country);
+      nextQuery.done = true;
+      if (rect) cursor.queries.push(...normalizeRect(rect).map((r) => tile(what, r, 0)));
+      else cursor.queries.push({ kind: "text", text: `${what} in ${nextQuery.text}`, pageToken: null, pages: 0, done: false });
+      await store.updateBatch(batch.id, { cursor, message: "" });
+      return;
+    }
+
+    const done = cursor.queries.filter((q) => q.done).length;
+    await store.updateBatch(batch.id, {
+      phase: PHASES.searching,
+      message: `Searching map area ${done + 1} of ${cursor.queries.length} (page ${nextQuery.pages + 1})`,
+    });
+    const page = await deps.places.search(nextQuery.text, params.country, nextQuery.pageToken, nextQuery.rect);
     const now = deps.now();
     const newCands: Candidate[] = page.places
       .filter((p) => p.id)
@@ -337,14 +408,20 @@ async function searchStep(batch: Batch, deps: Deps) {
     await store.updateBatch(batch.id, { phase: PHASES.collecting });
     await store.insertCandidates(newCands);
     nextQuery.pages += 1;
+    nextQuery.count = (nextQuery.count ?? 0) + page.places.length;
     nextQuery.pageToken = page.nextPageToken;
     nextQuery.done = !page.nextPageToken || nextQuery.pages >= MAX_PAGES_PER_QUERY;
-    await store.updateBatch(batch.id, { cursor: batch.cursor, message: "" });
+    // Dense area: Google may be hiding results beyond what it returned, so search 4 smaller tiles.
+    if (nextQuery.done && nextQuery.kind === "tile" && nextQuery.rect && (nextQuery.count ?? 0) >= SPLIT_THRESHOLD) {
+      const depth = nextQuery.depth ?? 0;
+      if (canSplit(nextQuery.rect, depth)) cursor.queries.push(...splitRect(nextQuery.rect).map((r) => tile(nextQuery!.text, r, depth + 1)));
+    }
+    await store.updateBatch(batch.id, { cursor, message: "" });
     return;
   }
 
   // 2) Duplicate pre-check against the sheet (saves audits/quota on known businesses).
-  const slice = pending.slice(0, AUDIT_CONCURRENCY * 2);
+  const slice = pending.slice(0, params.skipAudit ? 200 : AUDIT_CONCURRENCY * 2);
   const changed: Candidate[] = [];
   if (deps.sheets.configured) {
     await store.updateBatch(batch.id, { phase: PHASES.duplicates });
@@ -357,6 +434,22 @@ async function searchStep(batch: Batch, deps: Deps) {
         changed.push(c);
       }
     }
+  }
+
+  // 3a) Manual-review mode: export everything without inspecting websites.
+  if (params.skipAudit) {
+    for (const c of slice.filter((c) => c.state === "pending")) {
+      c.lead.websiteStatus = c.lead.websiteUrl ? "Not verified" : "No website found";
+      c.lead.auditNotes = c.lead.websiteUrl
+        ? "Website audit skipped (manual review mode)"
+        : "No website listed by the data source (not confirmed that none exists); audit skipped";
+      c.state = qualified >= target ? "surplus" : "qualified";
+      if (c.state === "qualified") qualified++;
+      changed.push(c);
+    }
+    await store.updateCandidates(changed);
+    await store.updateBatch(batch.id, { message: "" });
+    return;
   }
 
   // 3) Audit websites of new businesses.
@@ -399,7 +492,7 @@ async function searchStep(batch: Batch, deps: Deps) {
     }
     const cond = conditionOf(c.lead);
     if (params.conditions.includes(cond)) {
-      c.state = qualified >= params.targetLeads ? "surplus" : "qualified";
+      c.state = qualified >= target ? "surplus" : "qualified";
       c.reason = "";
       if (c.state === "qualified") qualified++;
     } else {

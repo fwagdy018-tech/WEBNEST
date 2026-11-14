@@ -45,6 +45,8 @@ export default function Home() {
   const [minReviews, setMinReviews] = useState("15");
   const [conditions, setConditions] = useState<WebsiteCondition[]>(CONDITIONS.filter((c) => c.default).map((c) => c.value));
   const [targetLeads, setTargetLeads] = useState("50");
+  const [allLeads, setAllLeads] = useState(true);
+  const [skipAudit, setSkipAudit] = useState(false);
 
   const [status, setStatus] = useState<BatchStatus | null>(null);
   const [running, setRunning] = useState(false);
@@ -118,7 +120,8 @@ export default function Home() {
         minRating: Number(minRating),
         minReviews: Number(minReviews),
         conditions,
-        targetLeads: Number(targetLeads),
+        targetLeads: allLeads ? 0 : Number(targetLeads),
+        skipAudit,
       }),
     });
     const json = await res.json();
@@ -211,8 +214,8 @@ export default function Home() {
             </label>
 
             <label className="field full">
-              <span>City / target area <small>(optional, comma-separated — each area is searched separately)</small></span>
-              <input type="text" value={areas} placeholder={regionInfo ? `e.g. ${regionInfo.cities.slice(0, 2).join(", ")}` : "Choose a state / province first"} onChange={(e) => setAreas(e.target.value)} disabled={!region} />
+              <span>City / target area <small>(optional — leave empty to cover the WHOLE {countryInfo.regionLabel.toLowerCase()})</small></span>
+              <input type="text" value={areas} placeholder={regionInfo ? `Whole ${regionInfo.name} — or e.g. ${regionInfo.cities.slice(0, 2).join(", ")}` : "Choose a state / province first"} onChange={(e) => setAreas(e.target.value)} disabled={!region} />
               {regionInfo && (
                 <div className="chips">
                   {regionInfo.cities.map((c) => (
@@ -231,7 +234,15 @@ export default function Home() {
               <input type="number" min={0} step={1} value={minReviews} onChange={(e) => setMinReviews(e.target.value)} />
             </label>
 
-            <fieldset className="full">
+            <label className="check full">
+              <input type="checkbox" checked={skipAudit} onChange={(e) => setSkipAudit(e.target.checked)} />
+              <span>
+                Export every business — I&apos;ll check them one by one
+                <small>Skips website audits (much faster). All businesses matching rating/location go to the sheet; duplicates are still removed.</small>
+              </span>
+            </label>
+
+            <fieldset className="full" disabled={skipAudit} style={{ opacity: skipAudit ? 0.45 : 1 }}>
               <legend>Website condition (include businesses whose website is…)</legend>
               <div className="checks">
                 {CONDITIONS.map((c) => (
@@ -245,13 +256,24 @@ export default function Home() {
 
             <label className="field">
               Number of new leads
-              <input type="number" min={1} max={500} step={1} value={targetLeads} onChange={(e) => setTargetLeads(e.target.value)} />
+              <input type="number" min={1} step={1} value={targetLeads} disabled={allLeads} onChange={(e) => setTargetLeads(e.target.value)} />
+            </label>
+            <label className="check" style={{ alignSelf: "end" }}>
+              <input type="checkbox" checked={allLeads} onChange={(e) => setAllLeads(e.target.checked)} />
+              <span>All businesses found<small>No limit — search every map area</small></span>
             </label>
           </div>
 
+          {!areas.trim() && (
+            <div className="notice info" style={{ marginTop: 14 }}>
+              Whole-state search: the state is searched as a map grid, and busy areas are split into smaller tiles until
+              Google stops returning full pages. Large states can take hundreds or thousands of billed Places requests.
+            </div>
+          )}
+
           {formError && <div className="notice err" style={{ marginTop: 14 }}>{formError}</div>}
           <div className="actions">
-            <button className="btn" type="submit" disabled={!config?.places || conditions.length === 0}>Start Search</button>
+            <button className="btn" type="submit" disabled={!config?.places || (conditions.length === 0 && !skipAudit)}>Start Search</button>
           </div>
         </form>
       )}
@@ -312,7 +334,7 @@ function Progress({ status, running, netError, onResume, onNew }: {
     <section className="card">
       <h2>{finished ? "Search complete" : status.stage === "failed" ? "Search paused" : "Search in progress"}</h2>
       <p className="meta" style={{ marginTop: -8, marginBottom: 14 }}>
-        {p.category} · {p.areas.length ? p.areas.join(", ") + ", " : ""}{region}, {getCountry(p.country)?.name} · ★ ≥ {p.minRating}, ≥ {p.minReviews} reviews · target {p.targetLeads} leads
+        {p.category} · {p.areas.length ? p.areas.join(", ") + ", " : ""}{region}, {getCountry(p.country)?.name} · ★ ≥ {p.minRating}, ≥ {p.minReviews} reviews · {p.targetLeads ? `target ${p.targetLeads} leads` : "all businesses"}{p.skipAudit ? " · no website audit" : ""}
       </p>
 
       {!finished && (
@@ -330,6 +352,9 @@ function Progress({ status, running, netError, onResume, onNew }: {
             })}
           </ul>
           <div className="msg">{status.message}</div>
+          <div className="meta">
+            Map areas searched: {status.coverage.areasDone} / {status.coverage.areasTotal} · Places requests: {status.coverage.placesRequests}
+          </div>
         </>
       )}
 
@@ -358,7 +383,7 @@ function Progress({ status, running, netError, onResume, onNew }: {
         {(finished || !running) && <button className="btn secondary" onClick={onNew}>New search</button>}
       </div>
       <p className="meta">
-        Batch <code>{status.id}</code> · started {new Date(status.createdAt).toLocaleString()} · Data: Google Places API — coverage is limited to what the provider returns (max 60 results per area).
+        Batch <code>{status.id}</code> · started {new Date(status.createdAt).toLocaleString()} · Data: Google Places API (official) — coverage is limited to what Google returns for each map area.
       </p>
     </section>
   );

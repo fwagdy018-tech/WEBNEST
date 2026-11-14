@@ -19,7 +19,10 @@ export interface SearchParams {
   minRating: number;
   minReviews: number;
   conditions: WebsiteCondition[];
+  /** 0 = no limit: export every business found. */
   targetLeads: number;
+  /** Export every business without inspecting websites (manual review). */
+  skipAudit: boolean;
 }
 
 /**
@@ -87,8 +90,27 @@ export interface Candidate {
 
 export type BatchStage = "searching" | "exporting" | "done" | "failed";
 
+export interface LatLng {
+  latitude: number;
+  longitude: number;
+}
+
+export interface Rect {
+  low: LatLng;
+  high: LatLng;
+}
+
+/**
+ * area: resolve a state/city name to its map boundary, then grid it.
+ * tile: search the category inside a map rectangle (split when saturated).
+ * text: plain text search (fallback when a boundary cannot be resolved).
+ */
 export interface DiscoveryQuery {
+  kind?: "area" | "tile" | "text";
   text: string;
+  rect?: Rect;
+  depth?: number;
+  count?: number;
   pageToken: string | null;
   pages: number;
   done: boolean;
@@ -96,6 +118,7 @@ export interface DiscoveryQuery {
 
 export interface BatchCursor {
   queries: DiscoveryQuery[];
+  placesRequests?: number;
   errorStreak: number;
   failedStage?: BatchStage;
 }
@@ -136,4 +159,5 @@ export interface BatchStatus {
   sheetUrl: string | null;
   createdAt: string;
   summary: BatchSummary;
+  coverage: { areasDone: number; areasTotal: number; placesRequests: number };
 }
